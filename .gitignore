@@ -1,0 +1,28 @@
+# === CREDENTIALS (NEVER COMMIT) ===
+wallet_info.json
+wallet_apikey.txt
+accounts.txt
+multi_accounts.json
+multi_accounts.txt
+master_mnemonic.txt
+results.json
+full_api_key.txt
+output.log
+
+# === DEBUG ===
+debug_*.png
+
+# === PYTHON ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# === TEMP ===
+.hermes-tmp.*/
+*.tmp
+
+# === EXTENSIONS (large binary) ===
+extensions/
