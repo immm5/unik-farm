@@ -26,6 +26,9 @@ from rich.align import Align
 from rich import box
 
 # ===================== CONFIG =====================
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+
 CHAIN_ID = 56
 KEY_NAME_PREFIX = "9router"
 API_BASE = "https://www.getunikey.ai"
@@ -108,14 +111,21 @@ def solve_turnstile(page, timeout=60):
     return turnstile
 
 def api_login(page, addr, privkey, turnstile):
-    challenge = page.evaluate("""(async function(){
-        var r = await fetch('/api/oauth/web3/challenge',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({wallet_address:'""" + addr + """'})
-        });
-        return await r.json();
-    })()""")
+    try:
+        challenge = page.evaluate("""(async function(){
+            var r = await fetch('/api/oauth/web3/challenge',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({wallet_address:'""" + addr + """'})
+            });
+            var text = await r.text();
+            try { return JSON.parse(text); } catch(e) { return {_raw: text.substring(0,200), _err: e.message}; }
+        })()""")
+    except Exception as e:
+        return None, "page.evaluate error: %s" % str(e)[:30]
+
+    if "_err" in challenge:
+        return None, "JSON parse err: %s" % challenge.get("_raw", "")[:20]
 
     if not challenge.get("success"):
         return None, "challenge failed"
@@ -360,88 +370,115 @@ def run_account(ctx, w, idx, total, clean):
         state.current_wallet = short
 
     page = None
-    try:
-        # Fresh page per account — avoids broken page.evaluate after cookie clear
-        if idx > 0:
-            update_status("Fresh session...")
-            ctx.clear_cookies()
-            time.sleep(1)
+    last_err = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Fresh page per account
+            if idx > 0 or attempt > 0:
+                update_status("Fresh session (attempt %d)..." % (attempt + 1))
+                ctx.clear_cookies()
+                time.sleep(1)
 
-        page = ctx.new_page()
+            page = ctx.new_page()
 
-        # Step 1: Turnstile
-        turnstile = solve_turnstile(page)
-        if not turnstile:
-            with state.lock:
-                state.failed += 1
-                state.results.append((short, "-", "FAIL"))
-            return False
+            # Step 1: Turnstile
+            turnstile = solve_turnstile(page)
+            if not turnstile:
+                last_err = "turnstile timeout"
+                if page:
+                    try: page.close()
+                    except: pass
+                    page = None
+                update_status("Turnstile fail, retry %d/%d..." % (attempt + 1, MAX_RETRIES))
+                time.sleep(RETRY_DELAY)
+                continue
 
-        # Step 2: API login
-        update_status("API login...")
-        login_data, err = api_login(page, addr, privkey, turnstile)
-        if not login_data:
-            with state.lock:
-                state.failed += 1
-                state.results.append((short, err[:20], "FAIL"))
-            return False
+            # Step 2: API login
+            update_status("API login (attempt %d)..." % (attempt + 1))
+            login_data, err = api_login(page, addr, privkey, turnstile)
+            if not login_data:
+                last_err = err
+                if page:
+                    try: page.close()
+                    except: pass
+                    page = None
+                update_status("Login fail: %s, retry %d/%d..." % (err[:30], attempt + 1, MAX_RETRIES))
+                time.sleep(RETRY_DELAY)
+                continue
 
-        uid = login_data["id"]
-        actual_uname = login_data["username"]
+            uid = login_data["id"]
+            actual_uname = login_data["username"]
 
-        session = get_session_cookie(ctx)
-        if not session:
-            with state.lock:
-                state.failed += 1
-                state.results.append((short, "no session", "FAIL"))
-            return False
+            session = get_session_cookie(ctx)
+            if not session:
+                last_err = "no session cookie"
+                if page:
+                    try: page.close()
+                    except: pass
+                    page = None
+                time.sleep(RETRY_DELAY)
+                continue
 
-        # Step 3: Create key
-        update_status("Creating API key (unlimited)...")
-        if clean:
-            deleted = delete_all_keys(session, uid)
-            if deleted > 0:
-                update_status("Deleted %d old keys, creating new..." % deleted)
+            # Step 3: Create key
+            update_status("Creating API key...")
+            if clean:
+                deleted = delete_all_keys(session, uid)
+                if deleted > 0:
+                    update_status("Deleted %d old keys..." % deleted)
 
-        token_id, err = create_api_key(session, uid, key_name)
-        if not token_id:
-            with state.lock:
-                state.failed += 1
-                state.results.append((short, err[:20], "FAIL"))
-            return False
+            token_id, err = create_api_key(session, uid, key_name)
+            if not token_id:
+                last_err = err
+                if page:
+                    try: page.close()
+                    except: pass
+                    page = None
+                time.sleep(RETRY_DELAY)
+                continue
 
-        # Step 4: Get full key
-        update_status("Fetching full key...")
-        full_key, err = get_full_key(session, uid, token_id)
-        if full_key and full_key.startswith("sk-") and len(full_key) > 20:
-            elapsed = time.time() - state.start_time
-            with state.lock:
-                state.success += 1
-                state.results.append((short, full_key, "OK"))
-                if state.avg_time == 0:
-                    state.avg_time = elapsed
-                else:
-                    state.avg_time = state.avg_time * 0.7 + elapsed * 0.3
-            update_status("OK %s" % actual_uname)
-            return True
-        else:
-            with state.lock:
-                state.failed += 1
-                state.results.append((short, err[:20] if err else "err", "FAIL"))
-            return False
+            # Step 4: Get full key
+            update_status("Fetching full key...")
+            full_key, err = get_full_key(session, uid, token_id)
+            if full_key and full_key.startswith("sk-") and len(full_key) > 20:
+                elapsed = time.time() - state.start_time
+                with state.lock:
+                    state.success += 1
+                    state.results.append((short, full_key, "OK"))
+                    if state.avg_time == 0:
+                        state.avg_time = elapsed
+                    else:
+                        state.avg_time = state.avg_time * 0.7 + elapsed * 0.3
+                update_status("OK %s" % actual_uname)
+                return True
+            else:
+                last_err = err or "key error"
+                if page:
+                    try: page.close()
+                    except: pass
+                    page = None
+                time.sleep(RETRY_DELAY)
+                continue
 
-    except Exception as e:
-        with state.lock:
-            state.failed += 1
-            state.results.append((short, str(e)[:20], "ERROR"))
-        update_status("ERROR: %s" % str(e)[:50])
-        return False
-    finally:
-        if page:
-            try:
-                page.close()
-            except:
-                pass
+        except Exception as e:
+            last_err = str(e)[:50]
+            update_status("ERROR: %s" % last_err)
+            if page:
+                try: page.close()
+                except: pass
+                page = None
+            time.sleep(RETRY_DELAY)
+            continue
+        finally:
+            if page:
+                try: page.close()
+                except: pass
+                page = None
+
+    # All retries exhausted
+    with state.lock:
+        state.failed += 1
+        state.results.append((short, last_err[:50], "FAIL"))
+    return False
 
 
 def main():
@@ -502,9 +539,9 @@ def main():
 
                         # Delay between accounts
                         if idx < count - 1:
-                            update_status("Cooldown 2s...")
+                            update_status("Cooldown 4s...")
                             live.update(update_layout())
-                            time.sleep(2)
+                            time.sleep(4)
 
                     update_status("Done!")
                     live.update(update_layout())
